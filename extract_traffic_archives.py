@@ -4,10 +4,10 @@ import glob
 
 # --- Configuration ---
 # This should match the DOWNLOAD_DIR from the other script
-ARCHIVE_DIR = "berlin_traffic_data/2024/Fahrstreifendetektoren_tgz"
+ARCHIVE_DIR = "berlin_traffic_data/2023/Fahrstreifendetektoren_tgz"
 
 # Where to put the extracted CSV files
-EXTRACT_DIR = os.path.join("berlin_traffic_data", "2024", "CSV_data")
+EXTRACT_DIR = os.path.join("berlin_traffic_data", "2023", "CSV_data")
 # --- End of Configuration ---
 
 def extract_all_archives(archive_path, extract_path):

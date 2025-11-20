@@ -3,7 +3,7 @@ import os
 
 # --- Configuration ---
 # Set the year you want to download
-TARGET_YEAR = "2024"  # Using 2023 as it's a full year
+TARGET_YEAR = "2023"  # Using 2023 as it's a full year
 
 # This is the path inside the Azure container
 DATA_PATH = "neue_qualitaetssicherung/Fahrstreifendetektoren"
