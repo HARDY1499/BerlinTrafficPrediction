@@ -3,7 +3,7 @@ build_tensor.py
 ================
 
 Convert the 454 per-detector × 12 monthly CSV files into a single
-(T, N, F) PyTorch tensor + (T, N) boolean mask + metadata, saved to
+(Time, Nodes, Features) PyTorch tensor + (T, N) boolean mask + metadata, saved to
 'berlin_traffic_tensor.pt'.
 
 The information pipeline between raw CSVs and the ST-GNN.
@@ -25,7 +25,9 @@ import os
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import torch
 
 
 # --- Configuration -----------------------------------------------------------
@@ -179,9 +181,9 @@ def load_one_detector(
             f"No monthly CSVs found for {detector_id} under {csv_root}"
         )
 
-    # 2. Concatenate, parse utc, normalise tz, set as index.
-    df = pd.concat(parts, ignore_index=True)
-    df[TIME_COL] = pd.to_datetime(df[TIME_COL], utc=True)  # forces tz-aware UTC
+    # 2. Concatenate, parse utc, normalise timezone, set as index.
+    df = pd.concat(parts, ignore_index=True) # ignoring original row numbers, we reindex later anyway
+    df[TIME_COL] = pd.to_datetime(df[TIME_COL], utc=True)  # forces timezone-aware UTC
 
     # 3. Defensive: sort and dedupe before reindex (see docstring).
     df = (
@@ -198,75 +200,257 @@ def load_one_detector(
     return df[[QUALITY_COL] + FEATURE_COLS]
 
 
-# --- Step 2: load one detector's full year onto the master axis -------------
+# --- Step 3: quality mask + short-gap handling ------------------------------
 
-# Columns we keep from each CSV. Everything else (ZScore_*, hist_cor,
-# localTime, month, Datum, Stunde des Tages) is either redundant with `utc`
-# or unused per the README's design decisions.
-USE_COLS = [
-    "utc",
-    "Vollständigkeit",
-    "qkfz", "qpkw", "qlkw",
-    "vkfz", "vpkw", "vlkw",
-]
+VOLLSTAENDIGKEIT_THRESHOLD = 90.0  # %; rows below this are treated as missing
+SHORT_GAP_LIMIT = 3                # hours; forward-fill up to this many in a row (hyperparameter to tune later)
 
 
-def load_one_detector(
-    detector_id: str,
-    master_index: pd.DatetimeIndex,
-    csv_root: Path = CSV_ROOT,
-) -> pd.DataFrame:
+def clean_one_detector(
+    df: pd.DataFrame,
+    quality_threshold: float = VOLLSTAENDIGKEIT_THRESHOLD,
+    short_gap_limit: int = SHORT_GAP_LIMIT,
+) -> tuple[pd.DataFrame, pd.Series]:
     """
-    Read all monthly CSVs for `detector_id`, concatenate, and reindex onto
-    `master_index`.
+    Apply quality filtering, short-gap forward-fill, and produce a validity mask.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Output of load_one_detector — columns [Vollständigkeit, *FEATURE_COLS],
+        indexed on the master hourly UTC axis.
+    quality_threshold : float
+        Vollständigkeit cutoff (%). Rows below this become NaN in the features.
+    short_gap_limit : int
+        Forward-fill at most this many consecutive NaN hours per column.
 
     Returns
     -------
-    pd.DataFrame
-        Indexed by UTC, length == len(master_index). Hours not present in
-        any monthly CSV become rows of NaN (visible as missing data).
-        Columns: USE_COLS (minus 'utc', which is the index).
+    features : DataFrame of shape (T, F)
+        Cleaned feature matrix on the same index. The Vollständigkeit column
+        is dropped — it served its purpose as a filter and the model should
+        not see it.
+    mask : Series of bool, shape (T,)
+        True where every feature column is non-NaN after cleaning.
 
-    Why reindex
-    -----------
-    The raw CSV rows are irregular: some hours are missing from the source
-    (sensor offline, no record published), monthly files sometimes start or
-    end mid-day, and there can be small overlaps at month boundaries.
-    Reindexing onto the canonical hourly axis converts the data from
-    'list of (time, value) tuples' into 'fixed-length arrays where
-    position == time'. Every downstream operation (sliding windows, masking,
-    normalization) assumes that property.
+    Why mask instead of drop
+    -----------------------
+    Deletion would break the time axis: sliding windows assume "row i+1 is
+    one hour after row i". The mask tells downstream loss/eval code to ignore
+    bad positions without disturbing the index.
+
+    Why forward-fill ONLY short gaps
+    -------------------------------
+    A 1–3 hour gap is usually transient (brief outage, maintenance). Carrying
+    the previous valid value forward is a defensible estimate. A 24-hour gap
+    is qualitatively different — the sensor was offline, rush hours came and
+    went, and filling yesterday's late-night speed into this morning's commute
+    is actively wrong. Past short_gap_limit, NaN + mask is more honest.
     """
-    # Glob across all 12 monthly subdirectories. sorted() makes the
-    # concat order deterministic (01, 02, ..., 12) — not strictly necessary
-    # after sort_values('utc') below, but cheap insurance.
-    monthly_files = sorted(csv_root.glob(f"*/{detector_id}.csv"))
-    if not monthly_files:
-        raise FileNotFoundError(
-            f"No monthly CSVs found for {detector_id} under {csv_root}. "
-            "Did extraction run for all 12 months?"
-        )
+    cleaned = df.copy()
 
-    # Read each month, keeping only the columns we need.
-    parts = [
-        pd.read_csv(f, sep=";", usecols=USE_COLS, low_memory=False)
-        for f in monthly_files
-    ]
-    df = pd.concat(parts, ignore_index=True)
+    # 1. Quality filter: low-completeness rows become NaN in the features.
+    #    Note: cleaned[QUALITY_COL] itself is left intact — we just don't
+    #    return it (the model should never see the quality flag).
+    low_quality = cleaned[QUALITY_COL] < quality_threshold
+    cleaned.loc[low_quality, FEATURE_COLS] = pd.NA
 
-    # Parse the UTC timestamp as a timezone-aware datetime. utc=True both
-    # parses the '+00:00' suffix and ensures the dtype matches master_index.
-    df["utc"] = pd.to_datetime(df["utc"], utc=True)
+    # 2. Forward-fill ONLY short gaps. ffill with `limit=N` fills at most
+    #    N consecutive NaN values per column, leaving longer gaps as NaN.
+    features = cleaned[FEATURE_COLS].ffill(limit=short_gap_limit)
 
-    # Defensive: drop duplicate timestamps if month boundaries overlapped.
-    # 'keep=first' is arbitrary — these duplicates should be exact copies.
-    df = df.drop_duplicates(subset="utc", keep="first")
+    # 3. Mask: True where every feature column has a value after cleaning.
+    #    .all(axis=1) gives row-wise AND across all feature columns.
+    mask = features.notna().all(axis=1)
 
-    # Sort by time and set utc as the index, then reindex onto the master axis.
-    df = df.sort_values("utc").set_index("utc")
-    df = df.reindex(master_index)
+    return features, mask
 
-    return df
+
+# --- Step 4: feature engineering --------------------------------------------
+
+CYCLIC_FEATURE_COLS = ["sin_hod", "cos_hod", "sin_dow", "cos_dow"]
+BERLIN_TZ = "Europe/Berlin"
+
+
+def add_cyclic_time_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Build a (T, 4) DataFrame of cyclic time encodings: sin/cos of
+    hour-of-day and sin/cos of day-of-week, computed in Berlin local time.
+
+    Why cyclic encoding
+    -------------------
+    Time is circular but raw integers are linear. With hour-as-int, hour 23
+    and hour 0 are 23 units apart even though they're one hour apart
+    physically. The model would have to learn this wraparound from data,
+    which is wasted capacity. Sin/cos projects the hour onto a unit circle:
+    adjacent hours are nearby in (sin, cos) coordinates and the wraparound
+    is automatic. Both sin and cos are included for each cycle, providing
+    a complete representation as only including one would mean losing information 
+    about the phase (0 to 2π; whether it's 12 or 24). 
+    Two features per cycle instead of 24 one-hots, with
+    continuity built in. We do this for both hour-of-day and day-of-week 
+    to capture daily and weekly patterns.
+
+    Why Berlin local time
+    --------------------
+    Rush hour happens at 8 a.m. Berlin time, not 8 a.m. UTC. Converting to
+    local time aligns the daily cycle with human activity and makes future
+    attention plots interpretable. UTC would also work, just shifted.
+    """
+    local = index.tz_convert(BERLIN_TZ)
+    hod = local.hour          # 0..23
+    dow = local.dayofweek     # 0..6  (Mon=0, Sun=6)
+
+    return pd.DataFrame(
+        {
+            "sin_hod": np.sin(2 * np.pi * hod / 24),
+            "cos_hod": np.cos(2 * np.pi * hod / 24),
+            "sin_dow": np.sin(2 * np.pi * dow / 7),
+            "cos_dow": np.cos(2 * np.pi * dow / 7),
+        },
+        index=index,
+    )
+
+
+def impute_seasonal_mean(features: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fill remaining NaNs in each column with the same-hour-of-week mean
+    for that detector. Operates per column independently.
+
+    Why hour-of-week, not hour-of-day
+    --------------------------------
+    Weekday vs weekend traffic patterns differ substantially. The mean
+    for "Wed 15:00" is a much better estimate than "15:00 of any day".
+    168 buckets per column (7 days * 24 hours) stay statistically stable
+    with a year of data.
+
+    Why we still keep the mask
+    -------------------------
+    Imputation makes the input dense (the GCN can compute predictions at
+    every position) but the imputed value is not a real observation. The
+    mask from Step 3 continues to flag "this was originally missing", so
+    the training loss can ignore these positions. Result: the model
+    operates on dense inputs but only learns from real targets — the
+    standard ST-GNN convention.
+    """
+    out = features.copy()
+    # Hour-of-week bucket: 0..167. We use Berlin local time for consistency
+    # with the cyclic features above.
+    local = out.index.tz_convert(BERLIN_TZ)
+    how = local.dayofweek * 24 + local.hour  # monday 00:00 → 0, Sunday 23:00 → 167
+    seasonal = out.groupby(how).transform("mean")
+
+    # Fallback chain: seasonal mean -> column mean -> 0.
+    # - seasonal handles "this hour-of-week has data on other weeks"
+    # - column mean handles "this entire hour-of-week bucket is empty"
+    # - 0 handles "this column is empty for the whole year" (mask kills it anyway)
+    out = out.fillna(seasonal)
+    out = out.fillna(out.mean())
+    out = out.fillna(0.0)
+    return out
+
+
+def engineer_one_detector(
+    features: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Run the whole of Step 4 in one call: impute residual NaNs, then concatenate
+    cyclic time features. Returns a dense (T, F_in) DataFrame, where
+    F_in = len(FEATURE_COLS) + len(CYCLIC_FEATURE_COLS) = 6 + 4 = 10.
+    """
+    imputed = impute_seasonal_mean(features)
+    cyclic = add_cyclic_time_features(features.index)
+    return pd.concat([imputed, cyclic], axis=1)
+
+
+# --- Step 5: stack every detector into (T, N, F) tensors --------------------
+
+ALL_FEATURE_COLS = FEATURE_COLS + CYCLIC_FEATURE_COLS  # the F dimension
+
+
+def build_tensor(
+    detector_ids: list[str],
+    master_index: pd.DatetimeIndex,
+    csv_root: Path = CSV_ROOT,
+    show_progress: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run Steps 2-4 over every detector and stack the results.
+
+    Returns
+    -------
+    X : torch.Tensor, shape (T, N, F), dtype float32
+        Dense feature tensor. F = len(ALL_FEATURE_COLS) = 10.
+    mask : torch.Tensor, shape (T, N), dtype bool
+        True where the row is an originally-observed (post-Step-3) value
+        for that detector. The training loss should multiply by this.
+
+    Notes
+    -----
+    1. Pre-allocates the output arrays. Growing Python lists and calling
+       np.stack at the end works but copies memory twice; for a 160 MB
+       tensor that matters. Pre-allocating with a NaN sentinel also lets
+       us assert at the end that every cell was filled — a cheap guard
+       against silent indexing bugs.
+
+    2. We use float32 (not float64). 4 bytes per cell instead of 8 halves
+       the memory footprint and matches what PyTorch wants on the GPU.
+       Speeds and flows fit fine in float32 precision.
+
+    3. If a single detector fails (file missing, parse error, ...) we
+       log it and continue — losing one column is better than aborting
+       the whole 2-minute run. The mask for that detector stays all-False
+       so downstream code ignores it.
+    """
+    T = len(master_index)
+    N = len(detector_ids)
+    F = len(ALL_FEATURE_COLS)
+
+    # Pre-allocate. NaN sentinel for X so a fill bug becomes a loud failure.
+    X = np.full((T, N, F), np.nan, dtype=np.float32)
+    mask = np.zeros((T, N), dtype=bool)
+
+    iterator = enumerate(detector_ids)
+    if show_progress:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(
+                iterator, total=N, desc="Building tensor", unit="det",
+            )
+        except ImportError:
+            pass  # progress bar is nice-to-have, not essential
+
+    failures: list[tuple[str, str]] = []
+    for i, det_id in iterator:
+        try:
+            raw = load_one_detector(det_id, master_index=master_index,
+                                    csv_root=csv_root)
+            features, m = clean_one_detector(raw)
+            engineered = engineer_one_detector(features)
+
+            # Defensive: column order must match ALL_FEATURE_COLS exactly.
+            X[:, i, :] = engineered[ALL_FEATURE_COLS].to_numpy(dtype=np.float32)
+            mask[:, i] = m.to_numpy(dtype=bool)
+        except Exception as e:
+            failures.append((det_id, str(e)))
+            # Fill this column with zeros so downstream code can still index it;
+            # the mask stays all-False so the loss ignores it.
+            X[:, i, :] = 0.0
+
+    if failures:
+        print(f"\n[warn] {len(failures)} detector(s) failed and were zeroed out:")
+        for det_id, err in failures[:5]:
+            print(f"  {det_id}: {err}")
+        if len(failures) > 5:
+            print(f"  ... and {len(failures) - 5} more")
+
+    # Hard check: pre-allocation sentinel should be fully overwritten.
+    assert not np.isnan(X).any(), (
+        f"X has {np.isnan(X).sum()} residual NaN cells. "
+        "Some detector's engineering step didn't produce a dense frame."
+    )
+
+    return torch.from_numpy(X), torch.from_numpy(mask)
 
 
 # --- Sanity-check entry point (will be replaced with full pipeline in Step 7)
@@ -308,6 +492,100 @@ def _sanity_check_step2() -> None:
     assert df.index.equals(time_idx), "Reindex index differs from master_index."
 
 
+def _sanity_check_step3() -> None:
+    """Cleaning + mask on a single detector. Shows quality recovery."""
+    print("\n--- Step 3 sanity check ---")
+    time_idx = build_master_time_index()
+    det_id = "TEU00002_Det0"
+    raw = load_one_detector(det_id, master_index=time_idx)
+    features, mask = clean_one_detector(raw)
+
+    T = len(features)
+    # Rows that were valid BEFORE cleaning (raw V>=threshold and not NaN).
+    raw_valid = (
+        raw[QUALITY_COL].notna()
+        & (raw[QUALITY_COL] >= VOLLSTAENDIGKEIT_THRESHOLD)
+    )
+
+    print(f"Detector            : {det_id}")
+    print(f"Total rows          : {T}")
+    print(f"Raw V >= {VOLLSTAENDIGKEIT_THRESHOLD:>2.0f}        : "
+          f"{raw_valid.sum()} ({raw_valid.mean()*100:.1f}%)")
+    print(f"Mask-valid rows     : {mask.sum()} ({mask.mean()*100:.1f}%)")
+    print(f"Recovered by ffill  : {mask.sum() - raw_valid.sum()} hours")
+    print(f"Feature columns     : {list(features.columns)}")
+    print("NaN counts per feature (post-clean):")
+    print(features.isna().sum().to_string())
+
+    assert len(features) == T and len(mask) == T
+    assert features.notna().all(axis=1).equals(mask)
+
+
+def _sanity_check_step4() -> None:
+    """Engineering: cyclic features + imputation. Check dense output + mask."""
+    print("\n--- Step 4 sanity check ---")
+    time_idx = build_master_time_index()
+    det_id = "TEU00002_Det0"
+    raw = load_one_detector(det_id, master_index=time_idx)
+    features, mask = clean_one_detector(raw)
+
+    pre_nan = features.isna().sum().sum()
+    engineered = engineer_one_detector(features)
+    post_nan = engineered.isna().sum().sum()
+
+    print(f"Detector            : {det_id}")
+    print(f"Shape after Step 3  : {features.shape}  (NaN cells: {pre_nan})")
+    print(f"Shape after Step 4  : {engineered.shape}  (NaN cells: {post_nan})")
+    print(f"Mask coverage       : {mask.sum()}/{len(mask)} "
+          f"({mask.mean()*100:.1f}%) — UNCHANGED from Step 3 (correct)")
+    print(f"Feature columns     : {list(engineered.columns)}")
+
+    # Verify cyclic features at known timestamps. Use Berlin local time.
+    sample = engineered.loc[[
+        engineered.index[0],   # 2023-01-01 00:00 UTC = 01:00 Berlin (winter)
+        engineered.index[24*7] # one week later, same Berlin clock time
+    ]]
+    print("\nCyclic features at two reference timestamps:")
+    print(sample[CYCLIC_FEATURE_COLS].to_string())
+
+    assert post_nan == 0, "Step 4 should leave a dense matrix; residual NaNs!"
+    assert engineered.shape[1] == len(FEATURE_COLS) + len(CYCLIC_FEATURE_COLS)
+    assert engineered.index.equals(features.index)
+
+
+def _sanity_check_step5() -> None:
+    """Build the full tensor on a small subset to verify shape, dtype, mask."""
+    print("\n--- Step 5 sanity check ---")
+    time_idx = build_master_time_index()
+    all_dets = find_valid_detectors()
+    subset = all_dets[:10]  # keep this cheap; full build is Step 6 onward
+
+    X, mask = build_tensor(subset, time_idx, show_progress=False)
+    T, N, F = X.shape
+
+    print(f"Detectors used      : {N} (out of {len(all_dets)})")
+    print(f"Tensor shape (X)    : {tuple(X.shape)}  dtype={X.dtype}")
+    print(f"Mask shape          : {tuple(mask.shape)}  dtype={mask.dtype}")
+    print(f"Memory footprint X  : {X.element_size() * X.numel() / 1e6:.1f} MB")
+    print(f"Memory footprint M  : {mask.element_size() * mask.numel() / 1e6:.1f} MB")
+    print(f"Mask coverage       : {mask.float().mean()*100:.1f}% "
+          f"(real observations across all {N} detectors)")
+    print(f"Per-detector valid% : "
+          f"{[round(mask[:, i].float().mean().item()*100, 1) for i in range(N)]}")
+    print(f"X[0, 0, :] (det 0 at t=0):")
+    for name, v in zip(ALL_FEATURE_COLS, X[0, 0, :].tolist()):
+        print(f"  {name:<10s}: {v:>10.4f}")
+
+    assert X.shape == (len(time_idx), len(subset), len(ALL_FEATURE_COLS))
+    assert mask.shape == (len(time_idx), len(subset))
+    assert X.dtype == torch.float32
+    assert mask.dtype == torch.bool
+    assert not torch.isnan(X).any()
+
+
 if __name__ == "__main__":
     _sanity_check_step1()
     _sanity_check_step2()
+    _sanity_check_step3()
+    _sanity_check_step4()
+    _sanity_check_step5()
