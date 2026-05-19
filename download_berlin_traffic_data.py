@@ -1,27 +1,24 @@
 import requests
 import os
 
-# --- Configuration ---
-# Set the year you want to download
-TARGET_YEAR = "2023"  # Using 2023 as it's a full year
+TARGET_YEAR = "2023"  # Using 2023 as it's a complete year
 
 # This is the path inside the Azure container
 DATA_PATH = "neue_qualitaetssicherung/Fahrstreifendetektoren"
 
-# This is the new base URL for the Azure Blob Storage
+# This is the base URL for the Azure Blob Storage
 BASE_URL = f"https://mdhopendata.blob.core.windows.net/verkehrsdetektion/{TARGET_YEAR}/{DATA_PATH}/"
 
 # Local directory where .tgz files will be saved
 # I've added '_tgz' to the name to make it clear these are the archives
 DOWNLOAD_DIR = os.path.join("berlin_traffic_data", TARGET_YEAR, "Fahrstreifendetektoren_tgz")
-# --- End of Configuration ---
 
 def download_monthly_archives(base_url, download_path, year):
     """
     Downloads monthly .tgz archives for the target year by
     constructing the URL for each month.
     """
-    print(f"--- Berlin Traffic Data Downloader (v3) ---")
+    print(f"--- Berlin Traffic Data Downloader ---")
     print(f"Targeting: {base_url}")
     print(f"Saving to: {download_path}")
     print(f"Target Year: {year}")
@@ -44,8 +41,7 @@ def download_monthly_archives(base_url, download_path, year):
 
         # Check if file already exists to avoid re-downloading
         if os.path.exists(local_file_path):
-            file_size = os.path.getsize(local_file_path)
-            print(f"  ... SKIPPING: File already exists at {local_file_path} ({file_size} bytes)")
+            print(f"  ... SKIPPING: File already exists at {local_file_path}")
             continue
 
         # 3. Download the file
@@ -54,9 +50,9 @@ def download_monthly_archives(base_url, download_path, year):
                 # Check for HTTP errors (like 404 Not Found)
                 r.raise_for_status()
                 
-                # Open the local file in 'write binary' mode
+                # Opening the local file in 'write binary' mode
                 with open(local_file_path, 'wb') as f:
-                    # Write file in chunks to avoid using too much memory
+                    # Writing file in chunks to avoid using too much memory
                     for chunk in r.iter_content(chunk_size=8192): 
                         f.write(chunk)
             

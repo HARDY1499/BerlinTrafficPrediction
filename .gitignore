@@ -1,0 +1,7 @@
+cat > .gitignore <<'EOF'
+.DS_Store
+.venv/
+berlin_traffic_data/
+*.pt
+__pycache__/
+EOF

@@ -45,8 +45,10 @@ def extract_all_archives(archive_path, extract_path):
                 print(f"  ... Contains {len(members)} files (e.g., {members[0].name})")
                 
                 # Extract all members to the target directory
-                tar.extractall(path=extract_path)
-                print(f"  ... SUCCESS: Extracted all files to {extract_path}")
+                month_str = os.path.basename(archive_file).split("_")[-1].replace(".tgz","")  # "01" .. "12"
+                target = os.path.join(extract_path, month_str)
+                os.makedirs(target, exist_ok=True)
+                tar.extractall(path=target)
         
         except tarfile.ReadError as e:
             print(f"  ... ERROR: Failed to read archive {filename}. It might be corrupt. {e}")
