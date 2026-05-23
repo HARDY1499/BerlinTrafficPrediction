@@ -9,13 +9,13 @@ Convert the 454 per-detector × 12 monthly CSV files into a single
 The information pipeline between raw CSVs and the ST-GNN.
 
 Pipeline (built incrementally):
-  Step 1: build_master_time_index() + find_valid_detectors()
-  Step 2: load_one_detector()
-  Step 3: quality mask + missing-value handling
-  Step 4: feature engineering (cyclic time, etc.)
-  Step 5: stack into (T, N, F) tensor
-  Step 6: train-split-only z-score normalization
-  Step 7: save .pt
+  Step 1: build_master_time_index() + find_valid_detectors()           [done]
+  Step 2: load_one_detector()                                          [done]
+  Step 3: quality mask + missing-value handling                        [done]
+  Step 4: feature engineering (cyclic time, etc.)                      [done]
+  Step 5: stack into (T, N, F) tensor                                  [done]
+  Step 6: train-split-only z-score normalization                       [done]
+  Step 7: save .pt                                                     [next]
 """
 
 from __future__ import annotations
@@ -453,6 +453,172 @@ def build_tensor(
     return torch.from_numpy(X), torch.from_numpy(mask)
 
 
+# --- Step 6: train-split-only z-score normalization -------------------------
+
+# Chronological split. No shuffling: the time axis is the whole point and
+# leakage from future hours into the training statistics would silently inflate
+# eval scores. The first 70% of hours train; the next 15% validates; the last
+# 15% tests.
+SPLIT_RATIOS = (0.70, 0.15, 0.15)
+
+# Numerical floor on sigma so a degenerate (constant) feature cannot trigger a
+# divide-by-zero. Standard ML hygiene; the value is small enough not to perturb
+# any real feature's scale.
+SIGMA_EPS = 1e-6
+
+
+def compute_split_boundaries(
+    T: int,
+    ratios: tuple[float, float, float] = SPLIT_RATIOS,
+) -> tuple[int, int]:
+    """
+    Return `(train_end, val_end)` — half-open right boundaries on the time axis.
+
+    A timestamp `t` belongs to:
+        train if  0          <= t < train_end
+        val   if  train_end  <= t < val_end
+        test  if  val_end    <= t < T
+
+    Why integers, not timestamps
+    ----------------------------
+    The tensor is indexed by position, not by datetime, so returning indices
+    keeps the downstream code as plain slices (`X[:train_end]`). Round-trip
+    to timestamps lives in the metadata dict saved at Step 7 if you need it
+    for plots later.
+
+    Why round instead of truncate
+    -----------------------------
+    `int(T * 0.7)` would systematically bias train smaller than asked when T
+    isn't a multiple of 10. `round(...)` is fairer and the off-by-one is
+    irrelevant statistically.
+    """
+    train_frac, val_frac, _ = ratios
+    train_end = round(T * train_frac)
+    val_end = round(T * (train_frac + val_frac))
+    # Defensive: the three slices must be non-empty and partition [0, T).
+    assert 0 < train_end < val_end < T, (
+        f"Bad split boundaries for T={T}: train_end={train_end}, val_end={val_end}"
+    )
+    return train_end, val_end
+
+
+# The 6 traffic feature channels live at indices [0, 6). The 4 cyclic channels
+# live at [6, 10). We slice this explicitly so the intent is hard to misread.
+TRAFFIC_FEATURE_SLICE = slice(0, len(FEATURE_COLS))                       # 0..5
+CYCLIC_FEATURE_SLICE = slice(len(FEATURE_COLS), len(ALL_FEATURE_COLS))    # 6..9
+
+
+def compute_normalization_stats(
+    X: torch.Tensor,
+    mask: torch.Tensor,
+    train_end: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute per-feature mean and std for the 6 traffic channels using ONLY
+    the training time slice AND ONLY positions the mask marks as real.
+
+    Parameters
+    ----------
+    X : (T, N, F) float32
+        Output of build_tensor.
+    mask : (T, N) bool
+        True where the value is an originally-observed (post-Step-3) reading.
+    train_end : int
+        Right boundary of the training slice (exclusive).
+
+    Returns
+    -------
+    mu, sigma : 1-D tensors of length len(FEATURE_COLS) = 6.
+
+    Why train-only stats
+    --------------------
+    Z-scoring uses the mean and std of a population to centre and scale data.
+    If those statistics are computed over the *entire* year, the model has
+    indirectly "seen" the validation and test distributions before training:
+    its inputs at eval time have been pre-scaled with knowledge of what the
+    future will look like. That's a textbook form of data leakage. By
+    confining μ/σ to the training slice we keep the eval set honest.
+
+    Why mask-out imputed positions
+    -----------------------------
+    Step 4 filled long gaps with the seasonal mean so the input is dense for
+    the GCN, but those filled values are artefacts — they make the
+    distribution look more concentrated than it is. Including them in μ/σ
+    would underestimate σ and slightly compress the real signal after
+    scaling. Computing stats over `mask=True` cells only gives an estimate
+    of the real-world distribution.
+
+    Why only the traffic channels
+    -----------------------------
+    The cyclic time features (sin/cos of hour-of-day, day-of-week) are
+    already in [-1, 1] with zero mean by construction. Z-scoring them would
+    destroy the unit-circle geometry — the wraparound midnight-to-1am
+    property exists specifically because sin/cos are NOT centred and
+    rescaled per observation. We leave them untouched.
+    """
+    # 1. Restrict to the training time slice across both X and mask.
+    X_train = X[:train_end]                          # (T_train, N, F)
+    mask_train = mask[:train_end]                    # (T_train, N)
+
+    # 2. Pull out only the 6 traffic channels.
+    X_train_traffic = X_train[:, :, TRAFFIC_FEATURE_SLICE]  # (T_train, N, 6)
+
+    # 3. Boolean-indexing trick: X_train_traffic[mask_train] selects rows
+    #    along the leading (T_train, N) dims wherever the mask is True,
+    #    yielding a flat (num_valid, 6) tensor of real observations.
+    valid_rows = X_train_traffic[mask_train]         # (num_valid, 6)
+
+    if valid_rows.numel() == 0:
+        raise RuntimeError(
+            "No valid (mask=True) cells in the training slice. "
+            "Cannot compute normalization stats."
+        )
+
+    # 4. Per-feature mean/std across the valid sample axis.
+    #    torch.std uses Bessel's correction by default — at ~millions of
+    #    samples per feature it's indistinguishable from the population std.
+    mu = valid_rows.mean(dim=0)                      # (6,)
+    sigma = valid_rows.std(dim=0)                    # (6,)
+
+    # 5. Defensive floor: a degenerate constant feature would otherwise
+    #    propagate inf/nan after division.
+    sigma = sigma.clamp(min=SIGMA_EPS)
+
+    return mu, sigma
+
+
+def apply_normalization(
+    X: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply (x - μ)/σ to the 6 traffic channels of X; leave the cyclic
+    channels untouched. Returns a NEW tensor (the input is not mutated).
+
+    Broadcasting recap
+    ------------------
+    `mu` and `sigma` are shape (6,). When we subtract them from a slice of
+    shape (T, N, 6), PyTorch broadcasts the (6,) along the leading two
+    dimensions, so every (t, n) position gets the same per-feature shift
+    and scale. This is exactly what z-scoring wants — a feature-wise
+    transformation that is identical across time and across detectors.
+
+    Why return a new tensor
+    ----------------------
+    In-place ops on a tensor we still want to compare against (e.g. for
+    "shape went from X to Z" debugging) are error-prone. The tensor is
+    only ~160 MB; the copy is cheap compared to a training run.
+    """
+    out = X.clone()
+    out[:, :, TRAFFIC_FEATURE_SLICE] = (
+        X[:, :, TRAFFIC_FEATURE_SLICE] - mu
+    ) / sigma
+    # Cyclic channels at CYCLIC_FEATURE_SLICE pass through unchanged by virtue
+    # of never being assigned to.
+    return out
+
+
 # --- Sanity-check entry point (will be replaced with full pipeline in Step 7)
 
 def _sanity_check_step1() -> None:
@@ -583,9 +749,81 @@ def _sanity_check_step5() -> None:
     assert not torch.isnan(X).any()
 
 
+def _sanity_check_step6() -> None:
+    """Z-score: train slice μ≈0, σ≈1 on traffic channels; cyclic untouched."""
+    print("\n--- Step 6 sanity check ---")
+    time_idx = build_master_time_index()
+    subset = find_valid_detectors()[:10]
+    X, mask = build_tensor(subset, time_idx, show_progress=False)
+    T, N, F = X.shape
+
+    # 1. Boundaries on the time axis.
+    train_end, val_end = compute_split_boundaries(T)
+    print(f"T = {T:>4d} hours total")
+    print(f"  train : [    0, {train_end:>4d})   "
+          f"({train_end} h, {train_end/T*100:.1f}%)")
+    print(f"  val   : [{train_end:>4d}, {val_end:>4d})   "
+          f"({val_end-train_end} h, {(val_end-train_end)/T*100:.1f}%)")
+    print(f"  test  : [{val_end:>4d}, {T:>4d})   "
+          f"({T-val_end} h, {(T-val_end)/T*100:.1f}%)")
+
+    # 2. Compute and inspect stats.
+    mu, sigma = compute_normalization_stats(X, mask, train_end)
+    print(f"\nμ per traffic feature (computed on train slice + mask only):")
+    for name, m, s in zip(FEATURE_COLS, mu.tolist(), sigma.tolist()):
+        print(f"  {name:<6s}  mu={m:>9.3f}   sigma={s:>9.3f}")
+
+    # 3. Apply and verify.
+    X_norm = apply_normalization(X, mu, sigma)
+
+    # 3a. Cyclic channels must be byte-for-byte identical.
+    cyclic_unchanged = torch.equal(
+        X[:, :, CYCLIC_FEATURE_SLICE],
+        X_norm[:, :, CYCLIC_FEATURE_SLICE],
+    )
+    print(f"\nCyclic channels untouched : {cyclic_unchanged}")
+
+    # 3b. On the training slice + mask, normalized traffic should have
+    #     ~zero mean and ~unit std per feature. (Validation/test slices
+    #     intentionally won't — that's the whole point of train-only stats:
+    #     drift between train and eval is preserved, not laundered out.)
+    Xn_train = X_norm[:train_end][:, :, TRAFFIC_FEATURE_SLICE]
+    valid_train = Xn_train[mask[:train_end]]   # (num_valid, 6)
+    mu_check = valid_train.mean(dim=0)
+    std_check = valid_train.std(dim=0)
+    print(f"\nPost-normalization stats on train slice (should be ~0, ~1):")
+    for name, m, s in zip(FEATURE_COLS, mu_check.tolist(), std_check.tolist()):
+        print(f"  {name:<6s}  mu={m:>9.3e}   sigma={s:>9.4f}")
+
+    # 3c. Show what happens on the val and test slices — drift is expected
+    #     and informative; do NOT panic if mu/sigma aren't exactly 0/1 here.
+    for label, lo, hi in [("val ", train_end, val_end), ("test", val_end, T)]:
+        Xn_slice = X_norm[lo:hi][:, :, TRAFFIC_FEATURE_SLICE]
+        m_slice = mask[lo:hi]
+        valid = Xn_slice[m_slice]
+        if valid.numel() == 0:
+            print(f"\n[{label}] no valid samples in slice — skipping")
+            continue
+        print(f"\nPost-normalization stats on {label} slice "
+              f"(expect mild drift from 0/1):")
+        mu_d = valid.mean(dim=0).tolist()
+        sd_d = valid.std(dim=0).tolist()
+        for name, m, s in zip(FEATURE_COLS, mu_d, sd_d):
+            print(f"  {name:<6s}  mu={m:>9.3f}   sigma={s:>9.4f}")
+
+    # Hard checks.
+    assert cyclic_unchanged, "Cyclic features were modified — they shouldn't be."
+    assert torch.allclose(mu_check, torch.zeros_like(mu_check), atol=1e-4), \
+        f"Train-slice mean is not ~0: {mu_check}"
+    assert torch.allclose(std_check, torch.ones_like(std_check), atol=1e-3), \
+        f"Train-slice std is not ~1: {std_check}"
+    assert X_norm.shape == X.shape and X_norm.dtype == X.dtype
+
+
 if __name__ == "__main__":
     _sanity_check_step1()
     _sanity_check_step2()
     _sanity_check_step3()
     _sanity_check_step4()
     _sanity_check_step5()
+    _sanity_check_step6()
