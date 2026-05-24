@@ -1,6 +1,6 @@
 # ST-GNN Berlin Traffic Prediction — Roadmap to Thesis-Quality Results
 
-**Last updated:** 2026-05-16 (resumed after 6 months idle)
+**Last updated:** 2026-05-24 (added ML-engineer extension track, §15–§19)
 **Target model:** A3T-GCN
 **Prediction horizons:** 3 h, 6 h, 12 h (multi-step)
 **Data:** Berlin VMZ Fahrstreifendetektoren, 2023
@@ -313,4 +313,158 @@ The critical path through 1–6 is roughly **one week of focused work** before y
 - **Class imbalance in congestion regimes:** free-flow dominates the year. Consider stratified evaluation: report metrics separately for "free flow" (`vkfz > 50`) and "congested" (`vkfz ≤ 50`).
 - **Holiday calendar:** Berlin school holidays affect traffic significantly. Make sure `is_holiday` distinguishes school vs public holidays.
 - **2024+ data:** if Berlin's open-data portal has 2024 published, adding it gives a second test year and is the cheapest path to a stronger result.
+
+---
+
+# Part II — ML-Engineer extension track (post-baseline, 3 months)
+
+The roadmap up to §14 produces a defensible *thesis*. The roadmap from §15 onward converts the same project into a *portfolio piece* that demonstrates the skills a working ML engineer is hired for: reproducibility, deployment, monitoring, retraining, and LLM-augmented interfaces.
+
+**Pre-requisite:** A3T-GCN trained, evaluated, and producing forecasts via §5–§8. Everything below assumes that model exists as a checkpoint on disk.
+
+**Why this matters (learning frame):** Most M.Sc. projects stop at "model trained, paper written." The gap between that and "could ship at a company" is the layers below. Each month adds one layer; each layer is a self-contained skill you can name on a CV and defend in an interview.
+
+---
+
+## 15. Timeline overview
+
+| Month | Theme | Headline deliverable | Skills demonstrated |
+|---|---|---|---|
+| **Month 1 (Jun–Jul 2026)** | MLOps foundations | Containerised training + inference, reproducible runs tracked in MLflow, CI on every push | Experiment tracking, Docker, data versioning, CI/CD |
+| **Month 2 (Jul–Aug 2026)** | Serving, monitoring, retraining | Deployed FastAPI service with drift detection and an automated weekly retraining pipeline | API design, observability, orchestration, champion/challenger model promotion |
+| **Month 3 (Aug–Sep 2026)** | GenAI / LLM layer | Natural-language query interface and/or RAG-augmented forecast explanations | Tool-using agents, RAG, embeddings, LLM evaluation |
+
+Build a *thin* version of each layer before deepening any of them. A working end-to-end story is more valuable than any single polished component.
+
+---
+
+## 16. Month 1 — MLOps foundations
+
+The goal of this month is to make every result reproducible and every artifact versioned. This is the part most students skip, and it's the single biggest "ML engineer vs ML student" signal an interviewer probes for.
+
+### 16.1. Experiment tracking (week 1)
+- Add **MLflow** (or **Weights & Biases** — pick one and stay) to `src/train.py`. Log every run's hyperparameters, per-epoch metrics, final test metrics, model checkpoint, and the Hydra/YAML config.
+- Log the **dataset hash** (sha256 of `berlin_traffic_tensor.pt`) so a run is traceable to the exact data it was trained on.
+- *Learning hook:* this is what makes the question "how did model v3 differ from v2?" answerable. Without it, you'll find yourself unable to defend your own results in three months.
+
+### 16.2. Data versioning (week 1–2)
+- Initialise **DVC** in the repo. Track `data/raw/` and `data/processed/` with DVC; commit the `.dvc` pointer files to git.
+- Push the data remote to a free tier (S3, GDrive, or Hugging Face Datasets — HF is easiest for public ML projects).
+- *Learning hook:* this teaches the separation between code (git) and data (DVC), which is the foundational MLOps idea.
+
+### 16.3. Containerisation (week 2–3)
+- Write `Dockerfile.train` that builds an image capable of running `python -m src.train --config ...` end-to-end.
+- Write `Dockerfile.serve` that exposes a FastAPI inference endpoint (stub for now — Month 2 fleshes this out).
+- Wire both together with `docker-compose.yml` so `docker compose up` reproduces the system locally.
+- *Learning hook:* once your project runs in a container, it runs anywhere. This is the single biggest unlock for "deployable" claims.
+
+### 16.4. CI/CD (week 3–4)
+- Add a **GitHub Actions** workflow that on every push: runs linting (`ruff`), runs unit tests on data-pipeline functions (use `pytest`), builds both Docker images, and pushes them to GitHub Container Registry.
+- Optional stretch: auto-deploy `Dockerfile.serve` to **Fly.io** or **Railway** free tier so the model has a real public URL.
+- *Learning hook:* CI catches breakage you don't notice; CD eliminates "works on my machine." Both are interview gold.
+
+### 16.5. Month 1 exit criteria
+- [ ] Every training run produces an MLflow entry traceable to a git commit and dataset hash.
+- [ ] `git clone … && docker compose up` reproduces a working serving endpoint on a fresh machine.
+- [ ] CI is green on `main` and blocks merges on red.
+
+---
+
+## 17. Month 2 — Serving, monitoring, retraining
+
+The goal of this month is to treat the model like a production system, not a notebook output. By the end, the system should retrain itself, notice when it's drifting, and surface that to a dashboard.
+
+### 17.1. Production inference API (week 1)
+- Flesh out `Dockerfile.serve` with a real FastAPI app:
+  - `POST /forecast` — accepts `{"sensor_ids": [...], "horizon_h": 12}`, returns predictions + confidence intervals.
+  - `GET /healthz` and `GET /readyz` — Kubernetes-style health checks.
+  - Pydantic models for request/response validation.
+- Log every request (input + prediction + latency) to a structured logger.
+- *Learning hook:* input validation, health checks, and structured logs are three things every production ML service has and most student projects don't.
+
+### 17.2. Monitoring & drift detection (week 2)
+- Integrate **Evidently AI** to compare incoming request distributions to the 2023 training distribution. Generate a drift report nightly.
+- Add a **Grafana + Prometheus** stack (or Evidently Cloud free tier) to visualise: request rate, p95 latency, error rate, drift score per feature, prediction MAE on labelled-after-the-fact data.
+- *Learning hook:* models silently rot. Drift detection is how you catch it before users do. This is currently one of the most-asked-about MLOps skills.
+
+### 17.3. Automated retraining pipeline (week 3)
+- Build a **Prefect** (or Airflow, or Dagster — Prefect is the easiest start) flow that runs weekly:
+  1. Pull the past week of fresh VMZ data.
+  2. Append to the existing tensor, re-compute normalisation stats on the rolling window.
+  3. Retrain the model from the previous champion checkpoint.
+  4. Evaluate on a frozen holdout.
+  5. If new MAE beats champion by ≥ 2 %, promote it (champion/challenger pattern). Otherwise alert.
+- *Learning hook:* "automated retraining with quality gates" is the sentence that separates hobby projects from production thinking. The promotion gate is the key design decision — discuss it explicitly in your README.
+
+### 17.4. Operator dashboard (week 4)
+- Single **Streamlit** (or Grafana) page exposing: current champion model version, last retrain timestamp, last drift report, live forecast for a user-selected sensor, predicted-vs-actual chart.
+- *Learning hook:* visualisation isn't just for the thesis — operators need to *see* the system. Building this teaches you what telemetry actually matters.
+
+### 17.5. Month 2 exit criteria
+- [ ] Public (or local) URL serves forecasts with sub-500ms p95 latency.
+- [ ] Drift report regenerates nightly and is visible in the dashboard.
+- [ ] Retraining flow has run at least 4 weekly cycles and promoted (or rejected) a challenger.
+
+---
+
+## 18. Month 3 — GenAI / LLM layer
+
+This is the month that makes the project stand out. Most M.Sc. traffic projects have zero LLM component; adding one demonstrates skills that didn't even exist on job descriptions two years ago. Pick **one** of the two angles below as the headline; treat the other as a stretch.
+
+### 18.1. Angle A — Natural-language query interface
+Build a small agent that lets a non-technical user ask questions like *"What's the predicted congestion on the A100 around 5pm Friday?"* or *"Compare this Friday's forecast to last Friday's actuals."*
+
+- Use the **Anthropic SDK** (or OpenAI / LangGraph) with tool use.
+- Expose three tools to the LLM:
+  1. `get_forecast(sensor_ids, time_range)` → calls your §17.1 FastAPI.
+  2. `get_historical(sensor_ids, time_range)` → queries the tensor.
+  3. `get_sensor_by_location(address_or_lat_lon)` → resolves Berlin street names / coords to `teuID`.
+- Build a thin Streamlit/Gradio chat UI on top.
+- *Learning hook:* this teaches function calling, tool design, and the agent loop — the most-hired-for GenAI skill in 2026.
+
+### 18.2. Angle B — RAG-augmented forecast explanations
+The model predicts numbers; an LLM turns them into explanations grounded in real-world context.
+
+- Curate a small knowledge base of Berlin events (concerts, demos, road closures, BVG strikes, weather alerts) — scrape `berlin.de` or use a manual CSV for the MVP.
+- Embed entries (e.g. `text-embedding-3-small` or a local model) into **Chroma** or **Qdrant** (both free, local).
+- On each forecast request, retrieve top-k events for the time/location, pass them + the numeric forecast to an LLM, return a *narrative* prediction: *"Expect heavier than usual congestion — Hertha BSC plays at 19:00 and there is roadwork on Kurfürstendamm."*
+- *Learning hook:* this teaches the full RAG stack (chunking, embedding, retrieval, prompt assembly) plus the hybrid ML+LLM pattern, which is where industry is heading.
+
+### 18.3. LLM evaluation (week 3–4, both angles)
+- Build a small **golden eval set** (~30–50 prompts) with expected behaviours (tools called, facts cited, no hallucination).
+- Score with a mix of: programmatic checks (was the right tool called?), LLM-as-judge (Claude grades Claude's output on faithfulness), and manual review.
+- Track eval scores in MLflow alongside the ST-GNN metrics.
+- *Learning hook:* "how do you know the LLM isn't hallucinating?" is the question every interviewer asks. Having an eval framework is the answer.
+
+### 18.4. Month 3 exit criteria
+- [ ] User can ask a natural-language traffic question and get a grounded answer (Angle A) or a narrative forecast (Angle B).
+- [ ] Eval set passes at ≥ 80 % on the chosen angle.
+- [ ] README has a demo GIF or recorded video — recruiters watch these.
+
+---
+
+## 19. Skills-on-CV mapping
+
+What the completed Part II earns you, in interview-ready language:
+
+| Skill bucket | The concrete claim | Evidence in the repo |
+|---|---|---|
+| **MLOps foundations** | "Versioned data with DVC and tracked experiments with MLflow across 50+ runs" | `.dvc/` files, MLflow tracking server, `results/` directory |
+| **Containerisation** | "Containerised training and serving with Docker; orchestrated locally via compose" | `Dockerfile.train`, `Dockerfile.serve`, `docker-compose.yml` |
+| **CI/CD** | "GitHub Actions pipeline runs tests, builds images, deploys to Fly.io on merge to main" | `.github/workflows/*.yml`, public deployed URL |
+| **Production serving** | "FastAPI inference service with Pydantic validation, structured logging, p95 < 500ms" | `src/serve/`, logged latency metrics |
+| **Monitoring** | "Drift detection with Evidently; Grafana dashboards on latency, error rate, drift score" | Evidently reports, Grafana JSON |
+| **Orchestration** | "Weekly retraining pipeline in Prefect with champion/challenger promotion gate" | `flows/retrain.py`, promotion log |
+| **GenAI / agents** | "Tool-using LLM agent over the forecast API; eval set scored 8x.x % faithfulness" | `src/agent/`, golden eval set, MLflow LLM metrics |
+| **RAG** *(if angle B)* | "RAG pipeline over Berlin events with Chroma; hybrid numeric+narrative forecasts" | `src/rag/`, embedding index |
+
+The full pitch — *"Built and deployed an ST-GNN traffic forecasting system on Berlin sensor data with MLflow experiment tracking, Dockerised FastAPI serving, automated weekly retraining via Prefect with drift detection, and an LLM-based natural-language query interface using tool calling and RAG"* — touches every bullet on a junior-to-mid ML engineer JD, all traceable to one coherent project.
+
+---
+
+## 20. Open questions for Part II
+
+- **Cloud vs local:** is a Fly.io / Railway free tier sufficient, or is it worth burning AWS/GCP free-tier credits to demonstrate cloud-native deployment (SageMaker / Vertex AI) explicitly?
+- **Which LLM provider:** Anthropic SDK is straightforward and the eval story is cleanest, but a local Llama / Mistral angle would additionally demonstrate self-hosted inference.
+- **Scope discipline:** if Month 1 slips, drop Angle B from Month 3 rather than skipping the eval framework — the eval framework is the more interview-relevant of the two.
 

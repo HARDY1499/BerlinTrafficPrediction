@@ -15,7 +15,25 @@ Pipeline (built incrementally):
   Step 4: feature engineering (cyclic time, etc.)                      [done]
   Step 5: stack into (T, N, F) tensor                                  [done]
   Step 6: train-split-only z-score normalization                       [done]
-  Step 7: save .pt                                                     [next]
+  Step 7: orchestrate everything + save to a single .pt bundle         [done]
+
+CLI
+---
+  python build_tensor.py            # run per-step sanity checks (10-det subset)
+  python build_tensor.py --build    # full pipeline → berlin_traffic_tensor.pt
+
+Saved bundle schema (the dict written by `save_artifacts`)
+----------------------------------------------------------
+  format_version      int       — schema version; bump on breaking changes.
+  X                   Tensor    — (T, N, F) float32, traffic chans z-scored.
+  mask                Tensor    — (T, N) bool; True = real (post-Step-3) obs.
+  det_ids             list[str] — length N, sorted; row i ↔ det_ids[i].
+  time_index          DatetimeIndex — length T, tz=UTC, hourly.
+  feature_names       list[str] — length F=10; first 6 traffic, last 4 cyclic.
+  n_traffic_features  int       — 6; convenience constant for slicing F.
+  mu, sigma           Tensor    — (6,) float32 train-only stats on traffic.
+  train_end, val_end  int       — chronological split right boundaries.
+  config              dict      — thresholds/ratios used to build this bundle.
 """
 
 from __future__ import annotations
@@ -619,7 +637,168 @@ def apply_normalization(
     return out
 
 
-# --- Sanity-check entry point (will be replaced with full pipeline in Step 7)
+# --- Step 7: orchestrate end-to-end + save the bundle ----------------------
+
+# Schema version stamped into the saved file. Bump this if you change the set
+# of keys (or their meaning) in the bundle dict, so old .pt files can be
+# detected and re-built rather than silently misread by future code.
+BUNDLE_FORMAT_VERSION = 1
+
+
+def build_artifacts(
+    detector_ids: list[str] | None = None,
+    master_index: pd.DatetimeIndex | None = None,
+    csv_root: Path = CSV_ROOT,
+    show_progress: bool = True,
+) -> dict:
+    """
+    Run Steps 1-6 end-to-end and return everything the model will need.
+
+    Parameters
+    ----------
+    detector_ids : list of str, optional
+        Which detectors to include. Defaults to the full sorted intersection
+        from `find_valid_detectors()`.
+    master_index : pd.DatetimeIndex, optional
+        Time axis. Defaults to the canonical 2023 hourly UTC index.
+
+    Returns
+    -------
+    artifacts : dict
+        A flat, self-describing bundle ready for `torch.save`. See the module
+        docstring "Saved bundle schema" section for the exact keys.
+
+    Why a single dict (vs. one file per array)
+    -----------------------------------------
+    The alternative is dropping X, mask, mu, sigma, ... as a folder of separate
+    files. A single dict keeps everything atomically loadable in one
+    `torch.load`, which prevents the canonical "I loaded X but forgot mu, so
+    my predictions are off by a factor of σ" bug. It also gives the artifact
+    a single hash for versioning.
+
+    Why we save the NORMALIZED X
+    ----------------------------
+    The model wants normalized inputs at training time. If we saved the raw
+    tensor and re-normalized on every training run we'd repeat the work AND
+    risk silent drift between runs (e.g. someone changes SPLIT_RATIOS without
+    realising it shifts μ/σ). We persist X_norm + (mu, sigma): de-normalising
+    for human-readable predictions (MAE in vehicles/h, not σ-units) is a
+    single broadcasted `x*σ+μ` in the eval loop.
+
+    Why we still save mu/sigma even though X is pre-normalized
+    ----------------------------------------------------------
+    Three reasons. (1) To invert predictions back to physical units for
+    metrics and plots. (2) To normalize *new* data (e.g. 2024 hours) using
+    the same statistics — the whole point of train-only stats. (3) Audit:
+    it makes the bundle self-describing without having to keep a separate
+    config file in sync.
+    """
+    if master_index is None:
+        master_index = build_master_time_index()
+    if detector_ids is None:
+        detector_ids = find_valid_detectors(csv_root=csv_root)
+
+    # Steps 2-5 wrapped: per-detector load + clean + engineer, stacked.
+    X_raw, mask = build_tensor(
+        detector_ids, master_index, csv_root=csv_root, show_progress=show_progress
+    )
+
+    # Step 6a: chronological split boundaries on the time axis.
+    train_end, val_end = compute_split_boundaries(X_raw.shape[0])
+
+    # Step 6b: train-only μ/σ over real (mask=True) traffic-channel cells.
+    mu, sigma = compute_normalization_stats(X_raw, mask, train_end)
+
+    # Step 6c: z-score the traffic channels; cyclic channels pass through.
+    X = apply_normalization(X_raw, mu, sigma)
+
+    # Bundle. Keep keys simple and snake_case; downstream code will rely on
+    # these names. Bump BUNDLE_FORMAT_VERSION if you ever change them.
+    return {
+        "format_version": BUNDLE_FORMAT_VERSION,
+        # Core arrays.
+        "X": X,                                    # (T, N, F) float32, normalized
+        "mask": mask,                              # (T, N) bool
+        # Identity / axes — so row indices can be mapped back to meaning.
+        "det_ids": list(detector_ids),             # length N, sorted, stable order
+        "time_index": master_index,                # length T, tz=UTC, hourly
+        "feature_names": list(ALL_FEATURE_COLS),   # length F=10
+        "n_traffic_features": len(FEATURE_COLS),   # 6; first n_traffic are z-scored
+        # Normalization stats (apply (x*σ)+μ to invert; traffic channels only).
+        "mu": mu,                                  # (6,) float32
+        "sigma": sigma,                            # (6,) float32
+        # Splits — half-open right boundaries, so the three slices partition
+        # [0, T):   train=[0, train_end), val=[train_end, val_end), test=[val_end, T).
+        "train_end": int(train_end),
+        "val_end": int(val_end),
+        # Reproducibility metadata. None of this is required to train; all of
+        # it is useful when you come back in 3 weeks and ask "wait, which
+        # quality threshold did I use for this tensor?".
+        "config": {
+            "year": YEAR,
+            "quality_threshold": VOLLSTAENDIGKEIT_THRESHOLD,
+            "short_gap_limit": SHORT_GAP_LIMIT,
+            "split_ratios": SPLIT_RATIOS,
+            "sigma_eps": SIGMA_EPS,
+            "berlin_tz": BERLIN_TZ,
+            "csv_root": str(csv_root),
+            "geojson_path": str(GEOJSON_PATH),
+        },
+    }
+
+
+def save_artifacts(artifacts: dict, path: Path = OUTPUT_PATH) -> None:
+    """
+    Persist the bundle to disk via `torch.save` and print a one-line summary.
+
+    Why torch.save (and not numpy.savez / parquet / hdf5)
+    -----------------------------------------------------
+    - `torch.save` is the de-facto standard for PyTorch artifacts and
+      preserves tensor dtype and shape exactly. The training loop will just
+      `torch.load(path)` and have everything as tensors already — no
+      `torch.from_numpy()` ceremony at the start of every run.
+    - It uses pickle under the hood, so the non-tensor fields (DatetimeIndex,
+      list[str], config dict) round-trip without manual (de)serialization.
+    - One file = one atomic artifact. Easier to checksum, move, version.
+
+    The trade-off is that pickle-based files are Python-specific and have a
+    well-known security caveat (never `torch.load` untrusted .pt files). For
+    a learning/portfolio project that's the right call; production pipelines
+    that need cross-language interop would reach for parquet/HDF5 instead.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(artifacts, path)
+
+    size_mb = path.stat().st_size / 1e6
+    X = artifacts["X"]
+    print(
+        f"\n[save] Wrote {path.name} ({size_mb:.1f} MB on disk)\n"
+        f"       X shape : {tuple(X.shape)} dtype={X.dtype}\n"
+        f"       Splits  : train=[0, {artifacts['train_end']}), "
+        f"val=[{artifacts['train_end']}, {artifacts['val_end']}), "
+        f"test=[{artifacts['val_end']}, {X.shape[0]})\n"
+        f"       Path    : {path}"
+    )
+
+
+def load_artifacts(path: Path = OUTPUT_PATH) -> dict:
+    """
+    Convenience loader. Mirrors `save_artifacts`; returns the same dict shape.
+
+    Note on `weights_only=False`
+    ---------------------------
+    Newer PyTorch versions default `torch.load` to a "weights-only" safe
+    loader that refuses any non-tensor Python object inside the pickle. Our
+    bundle deliberately contains a DatetimeIndex, a config dict, and a list
+    of detector IDs, so we disable that guard. The contract is: only ever
+    call `load_artifacts` on files this script produced.
+    """
+    path = Path(path)
+    return torch.load(path, weights_only=False)
+
+
+# --- Per-step sanity checks -------------------------------------------------
 
 def _sanity_check_step1() -> None:
     """Print enough to confirm Step 1 produced reasonable axes."""
@@ -820,10 +999,102 @@ def _sanity_check_step6() -> None:
     assert X_norm.shape == X.shape and X_norm.dtype == X.dtype
 
 
+def _sanity_check_step7(tmp_path: Path | None = None) -> None:
+    """
+    End-to-end on a 10-detector subset: build → save → reload → verify equality.
+
+    Why a round-trip (and not just "did the file get written?")
+    ----------------------------------------------------------
+    The interesting failure mode in a save step isn't "no file appeared";
+    it's "the file appeared but a key is missing / a tensor's dtype was
+    silently downcast / a non-tensor field didn't survive pickle". The only
+    way to catch those is to load it back and `torch.equal` / `==` against
+    the in-memory original. So that's exactly what this does.
+    """
+    print("\n--- Step 7 sanity check ---")
+    if tmp_path is None:
+        # Sub-set bundle lands next to the real one so it's easy to spot/delete.
+        tmp_path = PROJECT_ROOT / "berlin_traffic_tensor_subset.pt"
+
+    time_idx = build_master_time_index()
+    subset = find_valid_detectors()[:10]
+
+    artifacts = build_artifacts(
+        detector_ids=subset, master_index=time_idx, show_progress=False
+    )
+    save_artifacts(artifacts, tmp_path)
+
+    # Reload and verify.
+    reloaded = load_artifacts(tmp_path)
+
+    # 1. Schema: every documented key is present.
+    expected_keys = {
+        "format_version", "X", "mask", "det_ids", "time_index",
+        "feature_names", "n_traffic_features", "mu", "sigma",
+        "train_end", "val_end", "config",
+    }
+    missing = expected_keys - reloaded.keys()
+    assert not missing, f"Reloaded bundle is missing keys: {missing}"
+
+    # 2. Tensor round-trip: bit-exact (torch.save preserves dtype + values).
+    assert torch.equal(artifacts["X"], reloaded["X"]), "X mismatch after round-trip"
+    assert torch.equal(artifacts["mask"], reloaded["mask"]), "mask mismatch"
+    assert torch.equal(artifacts["mu"], reloaded["mu"]), "mu mismatch"
+    assert torch.equal(artifacts["sigma"], reloaded["sigma"]), "sigma mismatch"
+
+    # 3. Non-tensor round-trip: pickle round-trips these by value.
+    assert artifacts["det_ids"] == reloaded["det_ids"]
+    assert artifacts["time_index"].equals(reloaded["time_index"])
+    assert artifacts["feature_names"] == reloaded["feature_names"]
+    assert artifacts["n_traffic_features"] == reloaded["n_traffic_features"]
+    assert artifacts["train_end"] == reloaded["train_end"]
+    assert artifacts["val_end"] == reloaded["val_end"]
+    assert artifacts["config"] == reloaded["config"]
+    assert artifacts["format_version"] == reloaded["format_version"]
+
+    print(f"\nRound-trip OK. Bundle keys: {sorted(reloaded.keys())}")
+    print(f"format_version    : {reloaded['format_version']}")
+    print(f"X.shape           : {tuple(reloaded['X'].shape)}")
+    print(f"det_ids[:3]       : {reloaded['det_ids'][:3]}")
+    print(f"time_index range  : {reloaded['time_index'][0]} → {reloaded['time_index'][-1]}")
+    print(f"config            : {reloaded['config']}")
+
+    # Tidy up the subset artifact so it doesn't pollute the project root.
+    tmp_path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
-    _sanity_check_step1()
-    _sanity_check_step2()
-    _sanity_check_step3()
-    _sanity_check_step4()
-    _sanity_check_step5()
-    _sanity_check_step6()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build the (T, N, F) PyTorch tensor + mask + metadata from the "
+            "Berlin VMZ CSVs. Default mode runs per-step sanity checks on a "
+            "small subset; pass --build for the real thing."
+        )
+    )
+    parser.add_argument(
+        "--build", action="store_true",
+        help=(
+            "Build the FULL tensor over all valid detectors and save it to "
+            f"{OUTPUT_PATH.name} (~2 min on a laptop, ~160 MB on disk). "
+            "Without this flag, only the per-step sanity checks run."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.build:
+        print("[run] Building full tensor over all valid detectors...")
+        artifacts = build_artifacts()
+        save_artifacts(artifacts, OUTPUT_PATH)
+        print("\n[run] Done. Load it elsewhere via:")
+        print(f"        from build_tensor import load_artifacts")
+        print(f"        bundle = load_artifacts()  # uses OUTPUT_PATH by default")
+    else:
+        _sanity_check_step1()
+        _sanity_check_step2()
+        _sanity_check_step3()
+        _sanity_check_step4()
+        _sanity_check_step5()
+        _sanity_check_step6()
+        _sanity_check_step7()
